@@ -15,7 +15,8 @@ protected:
 public:
 	Filter();
     Filter(float rate)
-    	: sampleRate(rate), previousOutput1(0.0f), previousOutput2(0.0f) {}
+        : sampleRate(rate), alpha(0.0f), previousOutput1(0.0f), previousOutput2(0.0f),
+          cutoff_(20.0f), threshold_(1.0f) {}
     	
     virtual ~Filter() {}
     

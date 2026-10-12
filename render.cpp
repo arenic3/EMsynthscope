@@ -1,190 +1,125 @@
 /*
-Electro magnetic synth, using two ungrounded analong wire inputs with a bela board,
-analog input 0 controls freq mod and analog 1 controls lowpass filter cutoff.
-Fun to play with if you are better at the keyboard than me.
-
--Nicolas Arellano
+Electromagnetic groove machine for Bela.
+Analog 0 sets absolute acid resonance; analog 1 optionally adds cutoff modulation.
 */
 
 #include <Bela.h>
-#include <vector> 
-#include <libraries/Midi/Midi.h>
 #include <libraries/Scope/Scope.h>
-#include <stdlib.h>
-#include "ADSR.h"
 #include "Filter.h"
+#include "Sequencer.h"
+#include "Voices.h"
 
-Midi gMidi;
-ADSR adsr;
-Filter* lowpass = nullptr;
+namespace {
+constexpr float kBpm = 124.0f;
+constexpr float kSwing = 0.0f; // 0 = straight; 0.15 = 57.5/42.5 long/short.
+constexpr bool kSquareWave = false;
+constexpr bool kUseSecondInputForCutoff = false;
+constexpr float kBaseCutoff = 250.0f;
+constexpr float kEnvelopeAmount = 2200.0f;
+constexpr float kMasterGain = 1.2f;
+constexpr float kGateFraction = 0.65f;
+
+// Bela analog values are nominally 0..1. Calibrate for your pickup and gain.
+constexpr float kEmCenter = 0.5f;
+constexpr float kEmScale = 2.0f;
+constexpr float kEmFloor = 0.02f;
+constexpr float kEmCeiling = 0.6f;
+constexpr float kEmSmoothingHz = 20.0f;
+constexpr float kMinResonance = 0.7f;
+constexpr float kMaxResonance = 8.0f;
+static_assert(kBpm > 0.0f, "BPM must be positive");
+static_assert(kEmCeiling > kEmFloor, "EM calibration range must be positive");
+
 Scope gScope;
+Sequencer gSequencer;
+DrumVoices gDrums;
+AcidVoice gAcid;
+LowPassFilter gEmA(44100.0f);
+LowPassFilter gEmB(44100.0f);
+float gLevelA = 0.0f;
+float gLevelB = 0.0f;
+double gGateRemaining = 0.0;
+bool gSlideToNext = false;
 
-const char* gMidiPort0 = "hw:0,0";
+float readMagnitude(BelaContext* context, unsigned int frame, unsigned int channel) {
+	float raw = analogRead(context, frame, channel);
+	if(!std::isfinite(raw)) return 0.0f;
+	return std::min(1.0f, std::fabs((raw - kEmCenter) * kEmScale));
+}
 
-float freq = 220.0f;
-float amp = 1;
-float phase = 0;
+float normalizedLevel(float magnitude) {
+	return std::max(0.0f, std::min(1.0f,
+		(magnitude - kEmFloor) / (kEmCeiling - kEmFloor)));
+}
+}
 
-float att = 1;
-float rel = 1;
-float cutoff = 300;
-float thresh = 0.8;
-
-float gAntennaA = 0.0f;
-float gAntennaB = 0.0f;
-
-const int maxNotes = 16;
-int activeNotes[maxNotes];
-int activeNoteCount = 0;
-
-void midiListener(MidiChannelMessage message, void *arg);
-
-
-bool setup(BelaContext *context, void *userData) {
-	
-	for(int i = 0; i < maxNotes; i++) activeNotes[i] = 0;
-	
-	if(gMidi.readFrom(gMidiPort0) < 0) {
-		rt_printf("unable to read from midi port");
+bool setup(BelaContext* context, void*) {
+	if(context->audioSampleRate <= 0.0f || context->audioFrames == 0 ||
+		context->audioOutChannels == 0 || context->analogFrames == 0 ||
+		context->analogInChannels == 0) {
+		rt_printf("Need audio output and at least one enabled analog input\n");
 		return false;
 	}
-	
-	gMidi.writeTo(gMidiPort0);
-	gMidi.enableParser(true);
-	gMidi.setParserCallback(midiListener, (void*)gMidiPort0);
-	
-	adsr.setSampleRate(context->audioSampleRate);
-	
-	lowpass = new LowPassFilter(context->audioSampleRate);
-	lowpass->setCutoff(cutoff);
-	lowpass->setThreshold(thresh);
-	
-	if(context->analogInChannels < 2) {
-		rt_printf("Error: need at least 2 analog input channels for antennas\n");
-		return false;
-	}
-	
+	gSequencer.setup(context->audioSampleRate, kBpm, kSwing);
+	gDrums.setup(context->audioSampleRate);
+	gAcid.setup(context->audioSampleRate);
+	// Reuse the original two-stage low-pass as a rectified EM envelope follower.
+	gEmA = LowPassFilter(context->audioSampleRate);
+	gEmB = LowPassFilter(context->audioSampleRate);
+	gEmA.setCutoff(kEmSmoothingHz);
+	gEmB.setCutoff(kEmSmoothingHz);
+	gEmA.setThreshold(1.0f);
+	gEmB.setThreshold(1.0f);
+	gLevelA = gLevelB = 0.0f;
+	gGateRemaining = 0.0;
+	gSlideToNext = false;
 	gScope.setup(3, context->audioSampleRate);
-	
 	return true;
 }
 
-float mapF(int noteNumber) {
-	return powf(2.0, (noteNumber - 69)/12.0) * 440.0;
-}
+void render(BelaContext* context, void*) {
+	for(unsigned int n = 0; n < context->audioFrames; ++n) {
+		// Use actual buffer sizes rather than assuming analog always runs at half rate.
+		unsigned int analogFrame = static_cast<unsigned int>(
+			static_cast<uint64_t>(n) * context->analogFrames / context->audioFrames);
+		gLevelA = gEmA.process(readMagnitude(context, analogFrame, 0));
+		gLevelB = context->analogInChannels > 1
+			? gEmB.process(readMagnitude(context, analogFrame, 1)) : 0.0f;
+		float resonance = kMinResonance
+			+ normalizedLevel(gLevelA) * (kMaxResonance - kMinResonance);
+		float cutoff = kBaseCutoff;
+		if(kUseSecondInputForCutoff)
+			cutoff += 1800.0f * normalizedLevel(gLevelB);
 
-void keyPressed(int noteNumber, int velocity) {
-	if (activeNoteCount < maxNotes) {
-		activeNotes[activeNoteCount] = noteNumber;
-		activeNoteCount++;
-		
-		freq = mapF(noteNumber);
-		
-		float db = map(velocity, 1, 127, -40, 0);
-		amp = powf(10.0, db / 20.0);
-		
-		if (activeNoteCount == 1) {
-			adsr.noteOn();
-		}
-		
-		rt_printf("note on: frequency: %f, amplitude: %f\n", freq, amp);
-	}
-}
-
-void keyReleased(int noteNumber) {
-	
-	bool activeNoteChanged = false;
-	
-	for (int i = activeNoteCount - 1; i >= 0; i--) {
-		if (activeNotes[i] == noteNumber) {
-			if (i == activeNoteCount - 1) {
-				activeNoteChanged = true;
-			}
-			
-			for (int j = i; j < activeNoteCount - 1; j++) {
-				activeNotes[j] = activeNotes[j + 1];
-			}
-			activeNoteCount--;
-		}
-	}
-	
-	if (activeNoteCount == 0) {
-		adsr.noteOff();
-	} else if (activeNoteChanged) {
-		int mostRecentNote = activeNotes[activeNoteCount - 1];
-		
-		freq = mapF(mostRecentNote);
-	}
-}
-
-void render(BelaContext *context, void *userData) {
-	
-	float envA = att;
-	float envR = rel;
-	
-	float fCut = cutoff;
-	
-	adsr.setAttack(envA);
-	adsr.setRelease(envR);
-	
-	lowpass->setCutoff(fCut);
-	lowpass->setThreshold(thresh);
-	
-    for (unsigned int n = 0; n < context->audioFrames; n++) {
-    	
-    	gAntennaA = (analogRead(context, n/2, 0) - 0.5f) * 2.0f;
-    	gAntennaB = (analogRead(context, n/2, 1) - 0.5f) * 2.0f;
-    	float antCutoff = map(fabsf(gAntennaA), 0.0f, 1.0f, cutoff * 0.5f, cutoff * 2.0f);
-    	lowpass->setCutoff(antCutoff);
-    	
-    	float out = 0.0f;
-    	float oAmp = amp * adsr.getNextValue();
-    	
-    	if (activeNoteCount > 0) {
-    		float fMod = freq * (1.0f + gAntennaB * 0.02f);
-    		
-    		phase += fMod/context->audioSampleRate;
-    		if (phase >= 1.0f) phase -= 1.0f;
-    		float saw = 2.0f * ((phase) - std::floor(phase)) - 1.0f;
-    		
-    		out = saw * oAmp;
-    	}
-    	
-    	float filtered = lowpass->process(out);
-    	
-    	for (unsigned int channel = 0; channel < context->audioOutChannels; channel++) {
-    		audioWrite(context, n, channel, filtered);
-    	}
-    	
-    	gScope.log(gAntennaA, gAntennaB, filtered);
-    }
-}
-
-void midiListener (MidiChannelMessage message, void *arg) {
-	
-	if (message.getType() == kmmNoteOn) {
-			int noteNumber = message.getDataByte(0);
-			int velocity = message.getDataByte(1);
-			
-			if (velocity == 0) {
-				keyReleased(noteNumber);
-				
+		if(gSequencer.tick()) {
+			const GrooveStep& step = kPattern[gSequencer.step()];
+			if(step.kick) gDrums.kick();
+			if(step.snare) gDrums.snare();
+			if(step.hat) gDrums.hat();
+			if(step.note >= 0) {
+				gAcid.noteOn(step.note, step.accent, gSlideToNext);
+				gSlideToNext = step.slide &&
+					kPattern[(gSequencer.step() + 1) % 16].note >= 0;
+				gGateRemaining = gSlideToNext ? 0.0
+					: gSequencer.duration() * kGateFraction;
 			} else {
-				keyPressed(noteNumber, velocity);
+				gAcid.noteOff();
+				gSlideToNext = false;
+				gGateRemaining = 0.0;
 			}
-			
-		} else if (message.getType() == kmmNoteOff) {
-			int noteNumber = message.getDataByte(0);
-			
-			keyReleased(noteNumber);
 		}
+		if(!gSlideToNext && gGateRemaining <= 0.0)
+			gAcid.noteOff();
+		float mix = gDrums.process()
+			+ gAcid.process(cutoff, resonance, kEnvelopeAmount, kSquareWave);
+		float out = 0.95f * std::tanh(kMasterGain * mix);
+		for(unsigned int channel = 0; channel < context->audioOutChannels; ++channel)
+			audioWrite(context, n, channel, out);
+		gScope.log(out, gLevelA, gLevelB);
+		gGateRemaining -= 1.0;
+	}
 }
 
-void cleanup(BelaContext *context, void *userData) {
-	gMidi.enableParser(false);
-	
-	if(lowpass != nullptr){
-		delete lowpass;
-		lowpass = nullptr;
-	}
+void cleanup(BelaContext*, void*) {
+	// All DSP state is owned statically; no MIDI device or heap resources to release.
 }
